@@ -2,7 +2,7 @@
 
 import functools
 from collections import namedtuple
-from typing import Callable
+from typing import Callable, Tuple
 
 from unittest import expectedFailure, skip, skipUnless
 from unittest.mock import patch
@@ -39,6 +39,21 @@ torch.set_float32_matmul_precision("high")
 index = torch.ops.aten.index
 
 
+def query_key_value_clones(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    dtype: torch.dtype = None,
+):
+    """Clones the query, key, and value tensors and moves them to the specified dtype."""
+    if dtype is None:
+        dtype = query.dtype
+    query_ref = query.clone().detach().to(dtype).requires_grad_(query.requires_grad)
+    key_ref = key.clone().detach().to(dtype).requires_grad_(key.requires_grad)
+    value_ref = value.clone().detach().to(dtype).requires_grad_(value.requires_grad)
+    return query_ref, key_ref, value_ref
+
+
 def create_attention(score_mod):
     return functools.partial(_flex_attention, score_mod=score_mod)
 
@@ -58,16 +73,6 @@ if common_utils.TEST_WITH_ROCM:
 
 
 # --------- Useful score mod functions for testing ---------
-
-test_score_mods = [
-    _identity,
-    _causal,
-    _rel_bias,
-    _rel_causal,
-    _generate_alibi_bias(8),
-]
-
-
 def _times_two(score, b, h, m, n):
     """Joint graph needed for correctness"""
     return score * 2
@@ -76,6 +81,17 @@ def _times_two(score, b, h, m, n):
 def _squared(score, b, h, m, n):
     """Joint graph needed for correctness"""
     return score * score
+
+
+test_score_mods = [
+    _identity,
+    _times_two,
+    _squared,
+    _causal,
+    _rel_bias,
+    _rel_causal,
+    _generate_alibi_bias(8),
+]
 
 
 def _head_offset(dtype: torch.dtype):
@@ -125,6 +141,14 @@ S = 2048
 D = 64
 
 
+def get_ref_compiled_error(
+    gold_tensor: torch.Tensor, ref_tensor: torch.Tensor, compiled_tensor: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    ref_error = (gold_tensor - ref_tensor).abs().mean()
+    compiled_error = (gold_tensor - compiled_tensor).abs().mean()
+    return ref_error, compiled_error
+
+
 class TestTemplatedSDPA(InductorTestCase):
     def run_test(
         self,
@@ -137,26 +161,60 @@ class TestTemplatedSDPA(InductorTestCase):
     ):
         sdpa_partial = create_attention(score_mod)
         compiled_sdpa = torch.compile(sdpa_partial)
-        q = torch.randn((B, H, S, D), dtype=dtype, device="cuda")
-        k = torch.randn((B, H, S, D), dtype=dtype, device="cuda")
-        v = torch.randn((B, H, S, D), dtype=dtype, device="cuda")
-        golden_out = sdpa_partial(
-            q.to(torch.float64), k.to(torch.float64), v.to(torch.float64)
-        )
-        ref_out = sdpa_partial(q, k, v)
+        q = torch.randn((B, H, S, D), dtype=dtype, device="cuda", requires_grad=True)
+        k = torch.randn((B, H, S, D), dtype=dtype, device="cuda", requires_grad=True)
+        v = torch.randn((B, H, S, D), dtype=dtype, device="cuda", requires_grad=True)
+        q_ref, k_ref, v_ref = query_key_value_clones(q, k, v)
+        q_gold, k_gold, v_gold = query_key_value_clones(q, k, v, torch.float64)
+        golden_out = sdpa_partial(q_gold, k_gold, v_gold)
+        ref_out = sdpa_partial(q_ref, k_ref, v_ref)
         compiled_out = compiled_sdpa(q, k, v)
 
-        compiled_error = (golden_out - compiled_out).abs().mean()
-        ref_error = (golden_out - ref_out).abs().mean()
-        # Note, it seems like we really are less accurate than the float32
-        # computation, likely due to the online softmax
-        if dtype == torch.float32:
-            fudge_factor = 10.0
-        else:
-            fudge_factor = 1.1
-        if compiled_error > ref_error * fudge_factor:
-            msg = f"Compiled error {compiled_error} is greater than ref error {ref_error} by more than {fudge_factor}X."
-            self.assertTrue(False, msg)
+        backward_grad = torch.randn((B, H, S, D), dtype=dtype, device="cuda")
+
+        golden_out.backward(backward_grad.to(torch.float64))
+        ref_out.backward(backward_grad)
+        compiled_out.backward(backward_grad)
+
+        with torch.no_grad():
+            ref_error, compiled_error = get_ref_compiled_error(
+                golden_out, ref_out, compiled_out
+            )
+            # Note, it seems like we really are less accurate than the float32
+            # computation, likely due to the online softmax
+            if dtype == torch.float32:
+                fudge_factor = 10.0
+            else:
+                fudge_factor = 1.1
+
+            self.assertTrue(
+                compiled_error < ref_error * fudge_factor,
+                f"Compiled error {compiled_error} is greater than ref error {ref_error} by more than {fudge_factor}X.",
+            )
+
+            q_ref_error, q_compiled_error = get_ref_compiled_error(
+                q_gold.grad, q_ref.grad, q.grad
+            )
+            self.assertTrue(
+                q_compiled_error < q_ref_error * fudge_factor,
+                f"q grad error {q_compiled_error} is greater than ref error {q_ref_error} by more than {fudge_factor}X.",
+            )
+
+            k_ref_error, k_compiled_error = get_ref_compiled_error(
+                k_gold.grad, k_ref.grad, k.grad
+            )
+            self.assertTrue(
+                k_compiled_error < k_ref_error * fudge_factor,
+                f"k grad error {k_compiled_error} is greater than ref error {k_ref_error} by more than {fudge_factor}X.",
+            )
+
+            v_ref_error, v_compiled_error = get_ref_compiled_error(
+                v_gold.grad, v_ref.grad, v.grad
+            )
+            self.assertTrue(
+                v_compiled_error < v_ref_error * fudge_factor,
+                f"v grad error {v_compiled_error} is greater than ref error {v_ref_error} by more than {fudge_factor}X.",
+            )
 
     @supported_platform
     @common_utils.parametrize("dtype", test_dtypes)
@@ -429,23 +487,6 @@ class TestTemplatedSDPA(InductorTestCase):
         causal_njt = create_njt_wrapper(_causal, offsets, seq_idx)
 
         self.run_test(causal_njt, dtype)
-
-    @supported_platform
-    def test_backwards_fails(self):
-        make_tensor = functools.partial(
-            torch.randn,
-            (B, H, S, D),
-            dtype=torch.float32,
-            device="cuda",
-            requires_grad=True,
-        )
-        q, k, v = make_tensor(), make_tensor(), make_tensor()
-        func = torch.compile(_flex_attention, backend="inductor", fullgraph=True)
-        with self.assertRaisesRegex(
-            AssertionError, "flex_attention_backward is not an OpOverload"
-        ):
-            out = func(q, k, v, _identity)
-            out.backward(torch.ones_like(out))
 
     @supported_platform
     def test_mixed_dtypes_fails(self):
